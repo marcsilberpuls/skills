@@ -5,9 +5,9 @@
 This skill plans one person's weekly assignments through a conversational flow:
 
 1. PM says "plan [person] next week" (or "plan [person] week of March 30")
-2. Claude gathers all data, computes available capacity, and proposes assignments
+2. Claude gathers all data from the Vercel planner API, proposes assignments
 3. PM reviews, adjusts, confirms
-4. Claude writes to Everhour via the Vercel API
+4. Claude writes confirmed assignments via the Vercel API
 
 ---
 
@@ -28,96 +28,111 @@ Extract from the PM's message:
 
 ## Step 2: Gather data
 
-Read these sources in parallel. Each may be empty — handle gracefully.
+### 2a. Authenticate (once per session)
 
-### 2a. Team capacity (from YAML)
-
-**File:** `team/team-directory.yaml`
-
-Read the person's `capacity` block. Key fields:
-
-| Field | Meaning | Example |
-|-------|---------|---------|
-| `avg_hours_day` | Base hours per workday | `8.15` |
-| `work_time_percent` | Employment percentage | `90` |
-| `schedule` | Per-weekday hour overrides | `{ Monday: 8.0, Friday: 0.0 }` |
-| `off_days` | Days with zero hours | `[Friday]` |
-| `working_days` | Allowed days (array) or rotating pattern (string) | `[Monday, Tuesday, Wednesday, Thursday]` or `"Jeden 2. Freitag frei"` |
-
-**Capacity computation** (mirrors `.agent/oslib/capacity.py`):
-
-1. **Base per day:** `avg_hours_day * work_time_percent / 100`
-   - Exception: if `working_days` is a text string (rotating pattern), use `avg_hours_day` directly — the percentage is already reflected in the average
-2. **Schedule overrides:** if `schedule` dict exists, replace per-weekday values
-3. **Off days:** zero out any day in `off_days`
-4. **Working days (array):** if `working_days` is an array, zero out any weekday not in the list
-5. **Sum Mon–Fri** for weekly total
-
-Example for Yannick Fischer (80%, off Fridays, schedule overrides):
-```
-Mon: 8.0  Tue: 8.0  Wed: 8.0  Thu: 8.0  Fri: 0.0  → 32.0h/week
+```bash
+curl -s -c /tmp/pc.txt -X POST \
+  https://silberpuls-pipeline.vercel.app/api/auth/unlock \
+  -H "Content-Type: application/json" \
+  -d '{"password":"PLANNER_PASSWORD"}'
 ```
 
-Example for Fran Marin (90%, rotating Friday, text pattern):
-```
-Base: 8.15h/day (work_time_percent already implicit)
-Mon: 8.15  Tue: 8.15  Wed: 8.15  Thu: 8.15  Fri: 8.15  → 40.75h/week
-(Every other Friday is off — check calendar/time-off for the specific week)
+The password comes from the `PLANNER_PASSWORD` environment variable. If not set, use 1Password CLI:
+```bash
+op item get "Silberpuls-pipeline" --fields password --reveal
 ```
 
-### 2b. Time-off (from holidays.jsonl)
+### 2b. Read the weekly snapshot (primary data source)
 
-**Important:** The Vercel `/api/planner/assignments` endpoint filters by `type === "project"` — it does NOT return time-off entries. Read time-off from the normalized data instead.
+**Endpoint:** `GET /api/planner/weekly?start=YYYY-MM-DD`
 
-**File:** `.agent/data/normalized/holidays.jsonl`
+```bash
+curl -s -b /tmp/pc.txt \
+  "https://silberpuls-pipeline.vercel.app/api/planner/weekly?start=2026-03-30"
+```
 
-Format: `{ user_id, start_date, end_date, type, status, duration }`
+This single call returns **everything** pre-computed for the target week:
 
-To match by person name, first resolve the person's Everhour `user_id` from:
-
-**File:** `.agent/data/normalized/everhour_users.jsonl`
-
-Format: `{ id, name, email, status, rate }`
-
-Match person name → `id`, then filter `holidays.jsonl` for entries where:
-- `user_id` matches
-- `status == "Approved"`
-- Date range overlaps with the target week
-
-Time-off entries are **hard constraints** — zero available hours on those days, no exceptions.
-
-If `holidays.jsonl` is empty or missing, also check Everhour resource planner assignments directly (these may include `type: "time-off"` entries from the Everhour API that aren't exposed via the Vercel route).
-
-### 2c. Calendar meetings (from JSONL files)
-
-**Files:**
-- `.agent/data/normalized/gcal_events.jsonl` — individual events with `person`, `date`, `duration_min`, `event_category`, `mapped_project`
-- `.agent/data/normalized/gcal_daily_load.jsonl` — daily aggregate with `person`, `date`, `meeting_hours`, `available_hours`, `has_all_day_event`
-
-Filter both files for the target person and target week dates.
-
-**If files are empty or missing:** proceed without meeting data. Flag in the proposal:
-> "Calendar data not available — capacity computed from team directory only. Meeting conflicts not reflected."
-
-**If files have data:** subtract `meeting_hours` from each day's base capacity.
-
-### 2d. Calendar-project mapping
-
-**File:** `.agent/data/config/calendar_project_mapping.json`
-
-Structure:
-```json
+**Response structure:**
+```typescript
 {
-  "project_rules": [
-    { "pattern": "vivatura", "everhour_project_id": "as:1212371417282301", "project_name": "Vivatura Website & Gesundheitsportal" }
-  ],
-  "internal_patterns": ["silberstammtisch", "all hands", ...]
+  mode: "weekly",
+  startDate: "2026-03-30",
+  endDate: "2026-04-03",
+  days: [{ isoDate: "2026-03-30", label: "Monday", shortLabel: "Mon" }, ...],
+  people: [
+    {
+      personId: "fran-marin",
+      name: "Fran Marin",
+      role: "Senior Designer",
+      capacityHours: 40.75,          // weekly total capacity
+      capacityByDay: [8.15, 8.15, 8.15, 8.15, 0],  // Mon–Fri
+      timeOffHours: 0,               // total time-off hours this week
+      timeOffByDay: [false, false, false, false, false],  // per-day boolean
+      timeOffHoursByDay: [0, 0, 0, 0, 0],  // per-day hours (supports half-days)
+      timeOffEntries: [              // detailed time-off entries
+        { type: "Holiday", startDate: "2026-04-03", endDate: "2026-04-03", durationDays: 1 }
+      ],
+      assignedTotalHours: 28.5,      // currently assigned
+      assignedDays: [7.5, 7.5, 6.0, 7.5, 0],  // per-day assigned totals
+      utilizationPct: 70,
+      projects: [
+        {
+          projectId: "as:1212371417282301",
+          projectName: "Vivatura Website & Gesundheitsportal",
+          assignedHours: 16,
+          trackedHours: 2.5,
+          budgetTotalEur: 25000,      // total project budget (may be null)
+          budgetSpentEur: 18000,      // already spent (may be null)
+          blocks: [                   // per-day assignment detail
+            { dayIndex: 0, assignedHours: 4.0, trackedHours: 1.0 },
+            { dayIndex: 1, assignedHours: 4.0, trackedHours: 0.5 },
+            { dayIndex: 2, assignedHours: 4.0, trackedHours: 1.0 },
+            { dayIndex: 3, assignedHours: 4.0, trackedHours: 0 }
+          ]
+        }
+      ]
+    }
+  ]
 }
 ```
 
-Use `project_rules` to identify which calendar events map to which Everhour projects. This drives **meeting anchoring** (Step 3).
+**From this single response, extract for the target person:**
+- **Capacity:** `capacityHours` (weekly total), `capacityByDay` (per-day)
+- **Time-off:** `timeOffByDay` (boolean per day), `timeOffHoursByDay` (hours per day — supports half-days), `timeOffEntries` (details)
+- **Current assignments:** `projects[]` with `assignedHours`, `trackedHours`, `blocks[]`
+- **Budget:** `budgetTotalEur`, `budgetSpentEur` per project (for Phase 2 budget warnings)
 
-### 2e. Project allocation plans
+**If the person is not in the snapshot:** They may be on full leave or inactive. Flag this to the PM.
+
+### 2c. Read existing assignments for deletion metadata
+
+The weekly snapshot shows what's assigned but **does not include `assignmentId` or `trackedSeconds`** needed for safe deletion. To get these, also call:
+
+```bash
+curl -s -b /tmp/pc.txt \
+  "https://silberpuls-pipeline.vercel.app/api/planner/assignments?personName=Fran%20Marin&startDate=2026-03-30&endDate=2026-04-03"
+```
+
+This returns project-type assignments with:
+```typescript
+{
+  assignments: [{
+    id: number,          // assignmentId — needed for DELETE
+    userId: number,
+    projectId: string,
+    startDate: string,
+    endDate: string,
+    timeSeconds: number,
+    totalHours: number,
+    trackedSeconds: number,  // if > 0, cannot delete
+    trackedHours: number,
+    canDelete: boolean       // true if trackedSeconds <= 0
+  }]
+}
+```
+
+### 2d. Project allocation plans (for baseline comparison)
 
 **Files:** `projects/2-active/*/planning/everhour-allocation-weekly.json`
 
@@ -135,52 +150,37 @@ Scan all files under `projects/2-active/*/planning/` for entries matching the ta
 
 If a project has no allocation file or no entry for this person/week, it may still appear via existing assignments or PM input.
 
-### 2f. Existing assignments (from Vercel API)
-
-**Endpoint:** `GET /api/planner/assignments?personName=X&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD`
-
-This returns only `type == "project"` assignments (time-off is handled separately in Step 2b). These show what is already booked and may need to be deleted + recreated.
-
-Record `assignmentId` and `trackedSeconds` for each — needed for safe deletion.
-
 ---
 
 ## Step 3: Compute the proposal
 
 ### 3a. Available hours per day
 
-For each weekday (Mon–Fri):
+From the weekly snapshot, for each weekday (Mon–Fri):
 
 ```
-available_hours = base_capacity - meeting_hours - time_off_reduction
+available_hours[i] = capacityByDay[i] - timeOffHoursByDay[i]
 ```
 
-Where:
-- `base_capacity` = from Step 2a (per-day schedule)
-- `meeting_hours` = from gcal_daily_load.jsonl (0 if no calendar data)
-- `time_off_reduction` = if time-off exists for that day, set available to 0
+If `timeOffByDay[i]` is `true`, available is 0 for that day.
+
+No manual capacity computation needed — the snapshot pre-computes this from team-directory.yaml, Everhour time-off, and Timetastic holidays (merged and deduplicated).
 
 ### 3b. Project hour inputs
 
-Start with the provisioning baseline (Step 2e) as weekly hour buckets per project. If no baseline exists, use existing assignments (Step 2f) as the starting point.
+Start with the provisioning baseline (Step 2d) as weekly hour buckets per project. If no baseline exists, use existing assignments from the snapshot (Step 2b) as the starting point.
 
 The PM may override these — "18h Vivatura" replaces whatever the baseline says.
 
-### 3c. Distribute hours across days (calendar anchoring)
+### 3c. Distribute hours across days
 
-For each project's weekly hours, distribute across available days using this priority:
+For each project's weekly hours, distribute across available days:
 
-1. **Anchor on meeting days:** If the person has a calendar event mapped to this project (via `calendar_project_mapping.json`), assign project hours on that day first. Include the meeting hours as part of the project total.
-2. **Fill remaining evenly:** Spread leftover hours evenly across other available days.
-3. **Respect daily caps:** Never exceed a day's available hours. If a day is full, spill to the next available day.
-4. **Time-off days get zero:** Never assign hours on time-off days.
+1. **Fill evenly:** Spread hours evenly across available days (days where `timeOffByDay` is false and `capacityByDay > 0`).
+2. **Respect daily caps:** Never exceed a day's available hours. If a day is full, spill to the next available day.
+3. **Time-off days get zero:** Never assign hours on time-off days.
 
-Example:
-- Fran has 18h Vivatura for the week
-- Wednesday has a 2h Vivatura meeting
-- Available hours: Mon 8h, Tue 8h, Wed 6h (8h - 2h meeting), Thu 8h, Fri 0h (off)
-- Anchor: Wed gets Vivatura hours first (meeting 2h + work = e.g. 4h)
-- Remaining 14h distributed across Mon, Tue, Thu (4.67h each)
+Note: Calendar-based meeting anchoring (placing project hours on days with project meetings) is not available while gcal data files are empty. When calendar sync is restored, also read `.agent/data/config/calendar_project_mapping.json` and `.agent/data/normalized/gcal_events.jsonl` to anchor project hours on meeting days.
 
 ### 3d. Handle over-allocation
 
@@ -198,23 +198,20 @@ Show a clear per-day, per-project grid. Format:
 ```
 === Fran Marin — Week of 2026-03-30 ===
 
-Capacity: 40.75h | Meetings: 6.5h | Time-off: 0h | Available: 34.25h
+Capacity: 40.75h | Time-off: 0h | Available: 40.75h
 
         Mon 30    Tue 31    Wed 01    Thu 02    Fri 03    TOTAL
-Vivat.   4.0       4.0       4.0*      4.0       —        16.0h
+Vivat.   4.0       4.0       4.0       4.0       —        16.0h
 ESN      2.0       2.0       2.0       2.0       —         8.0h
 Intern   1.5       1.5       —         1.5       —         4.5h
 ──────────────────────────────────────────────────────────────
 TOTAL    7.5       7.5       6.0       7.5       0.0      28.5h
-Avail.   8.15      8.15      6.15      8.15      0.0      30.6h
-Gap      0.65      0.65      0.15      0.65      0.0       2.1h
-
-* Wed: 2h Vivatura meeting + 2h deep work
+Avail.   8.15      8.15      8.15      8.15      0.0      32.6h
+Gap      0.65      0.65      2.15      0.65      0.0       4.1h
 
 Constraint notes:
-- Fri: off day (every other Friday pattern — this week is off)
-- Wed: 2h meeting reduces available deep-work time
-- Gap: 2.1h unallocated — PM to decide
+- Fri: off day
+- Gap: 4.1h unallocated — PM to decide
 
 Existing assignments that will be replaced:
 - Vivatura 16h (assignment #12345, 0s tracked) → DELETE + RECREATE
@@ -224,10 +221,9 @@ Existing assignments that will be replaced:
 ### Constraint highlight format
 
 Flag anything the PM should know:
-- Time-off days (hard constraint)
-- Days with heavy meetings (soft constraint — flag available hours)
-- Over-budget projects (from Everhour budget data)
-- Existing assignments with tracked time (cannot delete)
+- Time-off days (hard constraint — from snapshot `timeOffByDay`)
+- Half-day time-off (reduced capacity — from snapshot `timeOffHoursByDay`)
+- Existing assignments with tracked time (cannot delete — from Step 2c `trackedSeconds`)
 - Unallocated capacity (gap hours)
 
 ---
@@ -251,23 +247,9 @@ After each adjustment, re-display the updated grid. Keep iterating until PM says
 
 ## Step 6: Apply assignments
 
-### 6a. Authenticate
+### 6a. Delete existing work assignments
 
-```bash
-curl -s -c /tmp/pc.txt -X POST \
-  https://silberpuls-pipeline.vercel.app/api/auth/unlock \
-  -H "Content-Type: application/json" \
-  -d '{"password":"PLANNER_PASSWORD"}'
-```
-
-The password comes from the `PLANNER_PASSWORD` environment variable. If not set, use 1Password CLI:
-```bash
-op item get "Silberpuls-pipeline" --fields password --reveal
-```
-
-### 6b. Delete existing work assignments
-
-For each existing assignment (from Step 2f) where `type != "time-off"` and `trackedSeconds == 0`:
+For each existing assignment (from Step 2c) where `canDelete == true`:
 
 ```bash
 curl -s -b /tmp/pc.txt -X DELETE \
@@ -287,7 +269,7 @@ curl -s -b /tmp/pc.txt -X DELETE \
 **If `trackedSeconds > 0`:** Do NOT delete. Flag to PM:
 > "Assignment #12345 (ESN, 1.0h tracked) cannot be deleted — has tracked time. Keeping as-is."
 
-### 6c. Create new assignments
+### 6b. Create new assignments
 
 For each project in the confirmed plan, create one assignment per project spanning the relevant days:
 
@@ -311,15 +293,13 @@ curl -s -b /tmp/pc.txt -X POST \
 ```
 
 **API body options:**
-- `hours` + `days` array: same hours per day on specific days
 - `dayAllocations` array: variable hours per day (preferred — most flexible)
+- `hours` + `days` array: same hours per day on specific days
 - `hours` alone with `startDate`/`endDate`: same hours every day in range
 
-Use `dayAllocations` when hours vary by day (which they usually do after calendar anchoring).
+Use `dayAllocations` when hours vary by day. Skip days with zero hours for that project.
 
-Skip days where the person has zero hours for that project — do not include `0` in dayAllocations.
-
-### 6d. Verify and report
+### 6c. Verify and report
 
 After all API calls complete, show a summary:
 
@@ -339,35 +319,19 @@ Applied assignments for Fran Marin — week of 2026-03-30:
     ESN — existing assignment with tracked time kept as-is
 ```
 
-### 6e. Sync snapshot
-
-After writes, sync + rebuild + publish the Supabase planner snapshot:
-
-```bash
-python3 .agent/scripts/sync_everhour.py
-python3 .agent/scripts/build_everhour.py
-npx tsx apps/resource-planner/scripts/build-planner-snapshot.ts
-npx tsx apps/resource-planner/scripts/publish-planner-snapshot.ts
-```
-
-This ensures the planner UI reflects the new assignments. The planner app reads from the `planner_snapshots` Supabase table.
+Note: The Vercel API automatically syncs the Supabase planner snapshot after writes (`publishSnapshotAfterAssignmentChange`). No manual snapshot rebuild needed.
 
 ---
 
 ## Data source reference
 
-| Data | File / Endpoint | Format |
-|------|----------------|--------|
-| Team capacity | `team/team-directory.yaml` | YAML, `team_members[].capacity` |
-| Time-off | `.agent/data/normalized/holidays.jsonl` | JSONL: `{user_id, start_date, end_date, type, status, duration}` |
-| Everhour users (ID lookup) | `.agent/data/normalized/everhour_users.jsonl` | JSONL: `{id, name, email, status, rate}` |
-| Calendar events | `.agent/data/normalized/gcal_events.jsonl` | JSONL: `{person, date, duration_min, event_category, mapped_project}` |
-| Calendar daily load | `.agent/data/normalized/gcal_daily_load.jsonl` | JSONL: `{person, date, meeting_hours, available_hours, has_all_day_event}` |
-| Calendar-project map | `.agent/data/config/calendar_project_mapping.json` | JSON: `{project_rules: [{pattern, everhour_project_id, project_name}]}` |
-| Project allocations | `projects/2-active/*/planning/everhour-allocation-weekly.json` | JSON: `{everhour_project_id, weeks: [{week_start, entries: [{person, hours}]}]}` |
-| Everhour assignments | Vercel API: `GET /api/planner/assignments?personName=X&startDate=Y&endDate=Z` | JSON (project-type only, no time-off) |
-| Everhour projects | Vercel API: `GET /api/planner/assignments` (no params) | JSON: `{projects: [{id, name}]}` |
-| Everhour budgets | `.agent/data/normalized/everhour_budgets.jsonl` | JSONL: `{id, name, budget, spent}` |
+| Data | Source | What it provides |
+|------|--------|-----------------|
+| Weekly snapshot | `GET /api/planner/weekly?start=YYYY-MM-DD` | Capacity, time-off, assignments, budget per person per project — all pre-computed |
+| Assignment metadata | `GET /api/planner/assignments?personName=X&startDate=Y&endDate=Z` | Assignment IDs + tracked seconds (needed for safe deletion) |
+| Project list | `GET /api/planner/assignments` (no params) | `{ projects: [{ id, name }] }` — for resolving project IDs |
+| Project allocation plans | `projects/2-active/*/planning/everhour-allocation-weekly.json` | Provisioning baseline (planned hours per person per week) |
+| Team directory | `team/team-directory.yaml` | Person name resolution (names + aliases) |
 
 ---
 
@@ -386,6 +350,13 @@ curl -s -c /tmp/pc.txt -X POST \
 
 Returns `{"ok": true}` and sets `planner_unlocked` cookie.
 
+### Read weekly snapshot
+
+```bash
+curl -s -b /tmp/pc.txt \
+  "https://silberpuls-pipeline.vercel.app/api/planner/weekly?start=2026-03-30"
+```
+
 ### List projects
 
 ```bash
@@ -395,7 +366,7 @@ curl -s -b /tmp/pc.txt \
 
 Returns `{ projects: [{ id, name }] }`. Use `id` (format `as:XXXXXXXXX`) in all assignment operations.
 
-### Read assignments
+### Read assignments (for deletion metadata)
 
 ```bash
 curl -s -b /tmp/pc.txt \
@@ -421,10 +392,6 @@ curl -s -b /tmp/pc.txt -X POST \
   }'
 ```
 
-Alternative body formats:
-- `"hours": 4, "days": ["2026-03-30", "2026-03-31"]` — same hours per day
-- `"hours": 4` (no days/dayAllocations) — hours applied per day across startDate–endDate
-
 ### Delete assignment
 
 ```bash
@@ -442,7 +409,7 @@ curl -s -b /tmp/pc.txt -X DELETE \
   }'
 ```
 
-API rejects delete if `trackedSeconds > 0`. Always check before attempting.
+API rejects delete if `trackedSeconds > 0`. Always check `canDelete` from the GET response before attempting.
 
 ### Update assignment (replace)
 
@@ -472,7 +439,7 @@ These scripts implement similar logic. Read them for context, but the skill inst
 |--------|---------|
 | `.agent/scripts/propose_assignments.py` | Single-person proposal generator — reads calendar, Asana, budgets |
 | `.agent/scripts/apply_weekly_assignments.py` | Assignment writer — deletes old + creates new via Vercel API |
-| `.agent/oslib/capacity.py` | Capacity computation from team-directory.yaml — `compute_weekly_hours()` and `load_team_capacities()` |
+| `.agent/oslib/capacity.py` | Capacity computation from team-directory.yaml |
 
 ---
 

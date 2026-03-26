@@ -9,7 +9,7 @@ One person at a time: read, reason, propose, iterate, write.
 
 | Step | What happens | Who acts |
 |------|-------------|----------|
-| **1. Gather** | Read capacity, calendar, time-off, existing assignments, project plans | Claude |
+| **1. Gather** | Read weekly snapshot from Vercel API (capacity, time-off, assignments, budget — one call) | Claude |
 | **2. Propose** | Build per-day, per-project assignment grid with constraint highlights | Claude |
 | **3. Review** | PM adjusts in natural language ("move Thursday to ESN", "reduce Vivatura to 12h") | PM |
 | **4. Confirm** | PM types **confirm** to approve the final plan | PM |
@@ -52,7 +52,7 @@ python3 .agent/scripts/propose_assignments.py --person "Fran Marin" --week 2026-
 
 - `personName` must match `team/team-directory.yaml` exactly (or an alias listed there)
 - Week always starts on Monday (ISO week)
-- Calendar data (`.agent/data/normalized/gcal_*.jsonl`) may be empty — propose based on capacity alone, flag missing calendar data
-- Project IDs use Everhour format: `as:XXXXXXXXX` (from calendar mapping or API project list)
+- Primary data source: `GET /api/planner/weekly?start=YYYY-MM-DD` — returns capacity, time-off, assignments, and budget in one call
+- Project IDs use Everhour format: `as:XXXXXXXXX` (from API project list)
 - Provisioning baselines in `projects/2-active/*/planning/everhour-allocation-weekly.json` are advisory — PM has final say
-- Existing scripts (`propose_assignments.py`, `apply_weekly_assignments.py`, `.agent/oslib/capacity.py`) are references — the skill instructs Claude to perform the same logic inline
+- The Vercel API auto-syncs the Supabase snapshot after writes — no manual rebuild needed
