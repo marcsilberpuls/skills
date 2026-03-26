@@ -65,18 +65,28 @@ Mon: 8.15  Tue: 8.15  Wed: 8.15  Thu: 8.15  Fri: 8.15  → 40.75h/week
 (Every other Friday is off — check calendar/time-off for the specific week)
 ```
 
-### 2b. Time-off (from Everhour via Vercel API)
+### 2b. Time-off (from holidays.jsonl)
 
-**Endpoint:** `GET /api/planner/assignments?personName=X&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD`
+**Important:** The Vercel `/api/planner/assignments` endpoint filters by `type === "project"` — it does NOT return time-off entries. Read time-off from the normalized data instead.
 
-Filter results for entries with `type == "time-off"`. These are **hard constraints** — zero available hours on those days.
+**File:** `.agent/data/normalized/holidays.jsonl`
 
-```bash
-curl -s -b /tmp/pc.txt \
-  "https://silberpuls-pipeline.vercel.app/api/planner/assignments?personName=Fran%20Marin&startDate=2026-03-30&endDate=2026-04-03"
-```
+Format: `{ user_id, start_date, end_date, type, status, duration }`
 
-If a day has time-off, set that day's available hours to 0 regardless of capacity.
+To match by person name, first resolve the person's Everhour `user_id` from:
+
+**File:** `.agent/data/normalized/everhour_users.jsonl`
+
+Format: `{ id, name, email, status, rate }`
+
+Match person name → `id`, then filter `holidays.jsonl` for entries where:
+- `user_id` matches
+- `status == "Approved"`
+- Date range overlaps with the target week
+
+Time-off entries are **hard constraints** — zero available hours on those days, no exceptions.
+
+If `holidays.jsonl` is empty or missing, also check Everhour resource planner assignments directly (these may include `type: "time-off"` entries from the Everhour API that aren't exposed via the Vercel route).
 
 ### 2c. Calendar meetings (from JSONL files)
 
@@ -127,9 +137,9 @@ If a project has no allocation file or no entry for this person/week, it may sti
 
 ### 2f. Existing assignments (from Vercel API)
 
-**Endpoint:** Same as 2b — read all assignments for the person and week.
+**Endpoint:** `GET /api/planner/assignments?personName=X&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD`
 
-Filter for `type != "time-off"` to get current work assignments. These show what is already booked and may need to be deleted + recreated.
+This returns only `type == "project"` assignments (time-off is handled separately in Step 2b). These show what is already booked and may need to be deleted + recreated.
 
 Record `assignmentId` and `trackedSeconds` for each — needed for safe deletion.
 
@@ -349,11 +359,13 @@ This ensures the planner UI reflects the new assignments. The planner app reads 
 | Data | File / Endpoint | Format |
 |------|----------------|--------|
 | Team capacity | `team/team-directory.yaml` | YAML, `team_members[].capacity` |
+| Time-off | `.agent/data/normalized/holidays.jsonl` | JSONL: `{user_id, start_date, end_date, type, status, duration}` |
+| Everhour users (ID lookup) | `.agent/data/normalized/everhour_users.jsonl` | JSONL: `{id, name, email, status, rate}` |
 | Calendar events | `.agent/data/normalized/gcal_events.jsonl` | JSONL: `{person, date, duration_min, event_category, mapped_project}` |
 | Calendar daily load | `.agent/data/normalized/gcal_daily_load.jsonl` | JSONL: `{person, date, meeting_hours, available_hours, has_all_day_event}` |
 | Calendar-project map | `.agent/data/config/calendar_project_mapping.json` | JSON: `{project_rules: [{pattern, everhour_project_id, project_name}]}` |
 | Project allocations | `projects/2-active/*/planning/everhour-allocation-weekly.json` | JSON: `{everhour_project_id, weeks: [{week_start, entries: [{person, hours}]}]}` |
-| Everhour assignments | Vercel API: `GET /api/planner/assignments?personName=X&startDate=Y&endDate=Z` | JSON response |
+| Everhour assignments | Vercel API: `GET /api/planner/assignments?personName=X&startDate=Y&endDate=Z` | JSON (project-type only, no time-off) |
 | Everhour projects | Vercel API: `GET /api/planner/assignments` (no params) | JSON: `{projects: [{id, name}]}` |
 | Everhour budgets | `.agent/data/normalized/everhour_budgets.jsonl` | JSONL: `{id, name, budget, spent}` |
 
