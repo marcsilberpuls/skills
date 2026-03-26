@@ -44,7 +44,7 @@ See [REFERENCE.md](REFERENCE.md) for the full workflow, data sources, capacity l
 - All Everhour writes go through the Vercel API, never Everhour directly
 - Always query Everhour time-off before proposing any assignments
 - Time-off days are hard constraints — zero available hours, no exceptions
-- After applying assignments, sync + rebuild + publish the Supabase snapshot
+- Vercel API auto-syncs the Supabase snapshot after writes — no manual rebuild needed
 
 ## Quick commands (Claude Code)
 
