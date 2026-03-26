@@ -1,20 +1,21 @@
 ---
 name: refine-project
-description: Post-kickoff project refinement — budget math, allocation shaping, and assignment writing for a single project. PM defines team, hours per week, duration, and distribution; Claude computes budget breakdown, proposes weekly allocations, and writes assignments to Everhour via the Vercel API on confirm. Use when user says "refine [project]", "plan assignments for [project]", "set up allocations for [project]", or any variant of project-level resource allocation planning.
+description: Post-kickoff project refinement — budget math, phase-aware allocation shaping, and assignment writing for a single project. Claude detects project type, applies phase split profiles (delivery-heavy or discovery-heavy), computes role mixes per phase, and proposes multi-person weekly allocations respecting PM heavy/light patterns and phase sequencing. PM iterates on the full team allocation before confirming writes to Everhour via the Vercel API. Use when user says "refine [project]", "plan assignments for [project]", "set up allocations for [project]", or any variant of project-level resource allocation planning.
 ---
 
 # Refine Project — Allocation Planning Skill
 
-Post-kickoff refinement: compute budget, shape allocations, write assignments for one project.
+Post-kickoff refinement: detect project type, apply phase splits and role mixes, compute budget, shape multi-person allocations, write assignments for one project.
 
 | Step | What happens | Who acts |
 |------|-------------|----------|
 | **1. Parse** | Extract project name/slug from PM request. Resolve against `projects/2-active/*/`. If not provisioned, redirect to `/provision-project`. | Claude |
-| **2. Budget math** | Read `project-meta.json` budget, tracked costs, ask PM for external costs and split ratio. Compute estimate budget. Show breakdown, PM confirms. | Claude + PM |
-| **3. Allocation shaping** | PM defines person, hours/week, duration, distribution. Claude computes weekly hours, distributes across weekdays, respects time-off. Show proposal table. PM iterates. | Claude + PM |
-| **4. Confirm** | Show final summary of all assignments to be written. PM types **confirm**. | PM |
-| **5. Write allocation file** | Write `everhour-allocation-weekly.json` to the project planning directory. Commit to main. | Claude |
-| **6. Write assignments** | Auth to Vercel API. One POST per person-project with `dayAllocations` spanning all weeks. Distribute weekly hours across weekdays, skip time-off. Report success/failure. | Claude |
+| **2. Project type & phases** | Ask PM for project type to determine active disciplines. Apply phase split profile (delivery-heavy default). Compute phase budgets and role mixes. Show breakdown, PM confirms. | Claude + PM |
+| **3. Budget math** | Read `project-meta.json` budget, tracked costs, ask PM for external costs. Compute estimate budget using phase splits and role mixes. Show breakdown, PM confirms. | Claude + PM |
+| **4. Allocation shaping** | Build multi-person proposal across all phases. Apply PM heavy/light pattern. Enforce phase sequencing (discovery before design before dev). Show all team members in one table per week. PM iterates on all together. | Claude + PM |
+| **5. Confirm** | Show final summary of all assignments to be written. PM types **confirm**. | PM |
+| **6. Write allocation file** | Write `everhour-allocation-weekly.json` to the project planning directory. Commit to main. | Claude |
+| **7. Write assignments** | Auth to Vercel API. One POST per person-project with `dayAllocations` spanning all weeks. Distribute weekly hours across weekdays, skip time-off. Report success/failure. | Claude |
 
 See [REFERENCE.md](REFERENCE.md) for the full workflow, budget formulas, API shapes, and example commands.
 
