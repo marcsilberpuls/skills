@@ -2,12 +2,19 @@
 
 ## Overview
 
-This skill plans one person's weekly assignments through a conversational flow:
+This skill plans weekly assignments in two modes:
 
+**Single-person mode** (Steps 1–6):
 1. PM says "plan [person] next week" (or "plan [person] week of March 30")
 2. Claude gathers all data from the Vercel planner API, proposes assignments
 3. PM reviews, adjusts, confirms
 4. Claude writes confirmed assignments via the Vercel API
+
+**Full-team mode** (Steps 7–10):
+1. PM says "plan next week" (no person name)
+2. Claude fetches the weekly snapshot once, iterates through all active people alphabetically
+3. For each person: propose, budget-check, PM confirms, write immediately
+4. After last person: reconciliation check
 
 ---
 
@@ -332,6 +339,7 @@ Note: The Vercel API automatically syncs the Supabase planner snapshot after wri
 | Project list | `GET /api/planner/assignments` (no params) | `{ projects: [{ id, name }] }` — for resolving project IDs |
 | Project allocation plans | `projects/2-active/*/planning/everhour-allocation-weekly.json` | Provisioning baseline (planned hours per person per week) |
 | Team directory | `team/team-directory.yaml` | Person name resolution (names + aliases) |
+| Team directory (PM-safe) | `team/team-directory-pm.yaml` | Hourly rates (`finances.hourly_rate`) for budget warnings |
 
 ---
 
@@ -458,3 +466,163 @@ Before any write, present a clear summary and wait for explicit confirmation:
 > | KEEP | ESN Website (assignment #12346, 1h tracked) | — | — |
 >
 > Type **confirm** to apply.
+
+---
+
+## Step 7: Full-team flow — snapshot and sync offer
+
+When the PM says "plan next week" (or "plan the team", "weekly planning" — no person name), use the full-team flow.
+
+### 7a. Authenticate
+
+Same as Step 2a.
+
+### 7b. Fetch the weekly snapshot
+
+Same as Step 2b — `GET /api/planner/weekly?start=YYYY-MM-DD`. This returns all people in one call.
+
+Show the snapshot timestamp to the PM:
+
+> "Using planner data last synced at 08:15 today. If time-off was approved in the last hour, it may not be reflected. Want me to trigger a fresh sync first? (~5 minutes)"
+
+### 7c. Optional: trigger fresh sync
+
+If the PM wants fresh data:
+
+```bash
+gh workflow run daily-holiday-sync.yml
+gh workflow run hourly-planner-snapshot-sync.yml
+```
+
+Wait for both workflows to complete (~5 minutes), then re-fetch the snapshot (Step 7b).
+
+---
+
+## Step 8: Iterate through people
+
+### 8a. Sort and filter
+
+From the snapshot `people[]` array:
+
+1. **Sort alphabetically** by `name`
+2. **Skip** anyone where all entries in `timeOffByDay` are `true` (full-week time-off). Note to PM:
+   > "[Name] is on holiday this week — skipped."
+3. The remaining people are the active list to iterate through.
+
+### 8b. Per-person proposal
+
+For each active person, follow the single-person flow:
+- **Compute proposal:** Same as Steps 3a–3d (available hours, project baselines, distribute, handle over-allocation)
+- **Present proposal:** Same as Step 4 (per-day, per-project grid with constraints)
+- **Budget check:** See Step 8c below — add budget warnings to the proposal when applicable
+- **PM iteration:** Same as Step 5 (PM adjusts, Claude re-displays)
+- **Apply on confirm:** See Step 9 below (write immediately, partial commit)
+
+Then move to the next person.
+
+### 8c. Budget warnings
+
+After computing the proposal for a person, check each project's budget. Only warn when this week's proposed hours would exceed the remaining budget.
+
+**Budget data from snapshot:** `project.budgetTotalEur` and `project.budgetSpentEur`
+
+**Hourly rate from team directory:** `team/team-directory-pm.yaml` (PM-safe) or `team/team-directory.yaml` — field `finances.hourly_rate`
+
+**Calculation:**
+```
+remaining_eur = budgetTotalEur - budgetSpentEur
+proposed_cost = proposed_hours × hourly_rate
+overrun_eur = proposed_cost - remaining_eur
+overrun_hours = overrun_eur / hourly_rate
+safe_hours = remaining_eur / hourly_rate  (floored to nearest 0.5h)
+```
+
+**Warning format** (only show when `proposed_cost > remaining_eur`):
+
+> "[Project]: assigning [Name] [X]h this week would exceed the remaining budget by ~[overrun_hours]h (€[overrun_eur] over €[remaining_eur] remaining at €[hourly_rate]/h). Reduce to [safe_hours]h to stay within budget, or confirm anyway?"
+
+**When NOT to warn:**
+- `budgetTotalEur` is null (no budget set) — skip budget check
+- `proposed_cost <= remaining_eur` — within budget, no warning needed
+
+### 8d. Project ID resolution
+
+When PM mentions a project by name during iteration (e.g., "add 4h Sixt"):
+
+1. Fetch the project list: `GET /api/planner/assignments` (no params) — returns `{ projects: [{ id, name }] }`
+2. Match the PM's input against project names:
+   - **Exactly one match** → use it
+   - **Multiple matches** → ask: "Did you mean '[Full Name A]' (as:1234...) or '[Full Name B]' (as:5678...)?"
+   - **Zero matches** → ask: "No project found matching '[input]'. Available projects: [list]. Which one?"
+
+---
+
+## Step 9: Apply per person (partial commit)
+
+When the PM confirms a person's plan, write assignments immediately. Do not wait for the full team to be done.
+
+### 9a. Assignments with tracked time (PATCH)
+
+For assignments where `trackedSeconds > 0`, use PATCH to update in place — this preserves tracked time:
+
+```bash
+curl -s -b /tmp/pc.txt -X PATCH \
+  https://silberpuls-pipeline.vercel.app/api/planner/assignments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "assignmentId": 98765,
+    "userId": 111,
+    "personName": "Fran Marin",
+    "projectId": "as:1212371417282301",
+    "projectName": "Vivatura Website & Gesundheitsportal",
+    "startDate": "2026-03-30",
+    "endDate": "2026-04-03",
+    "hours": 6
+  }'
+```
+
+Required fields: `assignmentId`, `userId`, `personName`, `projectId`, `projectName`, `startDate`, `endDate`, `hours`.
+
+Get `assignmentId` and `userId` from the GET assignments call (Step 2c).
+
+### 9b. Clean assignments (DELETE + CREATE)
+
+For assignments where `trackedSeconds == 0` (`canDelete == true`): same as Step 6a (DELETE) + Step 6b (CREATE).
+
+### 9c. Verify per person
+
+After writing, show a brief summary (same as Step 6c) and move to the next person.
+
+**If PM stops mid-way** (closes conversation, says "stop", etc.): already-confirmed people's assignments are applied. Unconfirmed people are unchanged.
+
+---
+
+## Step 10: Reconciliation check
+
+After the last person is confirmed and written, run a final reconciliation.
+
+### 10a. Re-fetch snapshot
+
+```bash
+curl -s -b /tmp/pc.txt \
+  "https://silberpuls-pipeline.vercel.app/api/planner/weekly?start=YYYY-MM-DD"
+```
+
+### 10b. Check for issues
+
+Compare the fresh snapshot against what was planned. Flag:
+
+1. **Budget overruns:** Any project where `budgetSpentEur > budgetTotalEur` after all writes
+   > "⚠ [Project]: budget is now €[spent] / €[total] — €[overrun] over budget."
+
+2. **Over-utilization:** Any person where `utilizationPct > 100`
+   > "⚠ [Name]: utilization is [X]% — over-allocated by [Y]h."
+
+3. **API errors:** Any assignments that failed to write during the session (track these as you go in Step 9)
+   > "⚠ Failed to write [Name]'s [Project] assignment — [error message]. Retry manually."
+
+### 10c. Clean report
+
+If no issues are detected:
+
+> "All assignments applied. No issues detected."

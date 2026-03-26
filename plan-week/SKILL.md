@@ -1,9 +1,13 @@
 ---
 name: plan-week
-description: Weekly assignment planning for one person at a time. Reads team capacity, calendar, time-off, and project plans, then proposes per-day assignments. PM adjusts in natural language, confirms, and Claude writes to Everhour via the Vercel API. Use when user says "plan Fran next week", "plan assignments for Lina", "weekly planning for Yannick", or any variant of per-person weekly resource planning.
+description: Weekly assignment planning — single person or full team. Reads team capacity, calendar, time-off, and project plans, then proposes per-day assignments. PM adjusts in natural language, confirms, and Claude writes to Everhour via the Vercel API. Use when user says "plan Fran next week" (single person), "plan next week" or "plan the team" (full team), or any variant of weekly resource planning.
 ---
 
-# Plan Week — Single-Person Assignment Skill
+# Plan Week — Assignment Planning Skill
+
+Two modes: **single person** ("plan Fran next week") or **full team** ("plan next week").
+
+## Single-person mode
 
 One person at a time: read, reason, propose, iterate, write.
 
@@ -15,6 +19,19 @@ One person at a time: read, reason, propose, iterate, write.
 | **4. Confirm** | PM types **confirm** to approve the final plan | PM |
 | **5. Apply** | Delete old work assignments, create new ones via Vercel API | Claude |
 | **6. Verify** | Show applied assignments, flag any API errors | Claude |
+
+## Full-team mode
+
+Fetch snapshot once, iterate through every active person, write on each confirm.
+
+| Step | What happens | Who acts |
+|------|-------------|----------|
+| **1. Snapshot** | Authenticate, fetch weekly snapshot, show sync timestamp — offer optional fresh sync | Claude |
+| **2. Iterate** | Walk through `people[]` alphabetically; skip full-week time-off | Claude |
+| **3. Per person** | Propose assignments (same single-person format), show budget warnings if overrun | Claude |
+| **4. Confirm** | PM adjusts and confirms per person — assignments written immediately (partial commit) | PM + Claude |
+| **5. Next** | Move to next person; if PM stops mid-way, already-confirmed people are applied | Claude |
+| **6. Reconcile** | After last person: re-fetch snapshot, flag budget overruns, >100% utilization, API errors | Claude |
 
 See [REFERENCE.md](REFERENCE.md) for the full workflow, data sources, capacity logic, API shapes, and example commands.
 
@@ -36,6 +53,10 @@ See [REFERENCE.md](REFERENCE.md) for the full workflow, data sources, capacity l
 curl -s -c /tmp/pc.txt -X POST https://silberpuls-pipeline.vercel.app/api/auth/unlock \
   -H "Content-Type: application/json" -d '{"password":"PLANNER_PASSWORD"}'
 
+# Read weekly snapshot (all people, one call)
+curl -s -b /tmp/pc.txt \
+  "https://silberpuls-pipeline.vercel.app/api/planner/weekly?start=2026-03-30"
+
 # Read existing assignments for a person + week
 curl -s -b /tmp/pc.txt \
   "https://silberpuls-pipeline.vercel.app/api/planner/assignments?personName=Fran%20Marin&startDate=2026-03-30&endDate=2026-04-03"
@@ -43,6 +64,10 @@ curl -s -b /tmp/pc.txt \
 # List active Everhour projects (to resolve IDs)
 curl -s -b /tmp/pc.txt \
   "https://silberpuls-pipeline.vercel.app/api/planner/assignments"
+
+# Trigger fresh sync (if PM wants up-to-date time-off data)
+gh workflow run daily-holiday-sync.yml
+gh workflow run hourly-planner-snapshot-sync.yml
 
 # Propose assignments (existing script, read-only)
 python3 .agent/scripts/propose_assignments.py --person "Fran Marin" --week 2026-03-30
