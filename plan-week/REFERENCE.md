@@ -248,18 +248,32 @@ Deviations from provisioning plan:
 - Positive deviation = more hours than planned (over plan). Negative = fewer hours (under plan).
 - Zero deviation = no flag needed.
 
-### 4c. Constraint highlights
+### 4c. Change summary
+
+Show what's changing from current assignments (from snapshot `projects[]`):
+
+```
+Changes from current assignments:
+  Vivatura: 16h → 12h (-4h) — provisioning plan says 12h
+  ESN: 8h → 8h (no change)
+  Intern: 0h → 4.5h (new)
+```
+
+### 4d. Constraint highlights
 
 Flag anything the PM should know:
 - Time-off days (hard constraint — from snapshot `timeOffByDay`)
 - Half-day time-off (reduced capacity — from snapshot `timeOffHoursByDay`)
 - Existing assignments with tracked time (cannot delete — from Step 2c `trackedSeconds`)
-- Unallocated capacity (gap hours)
+- **Unallocated capacity:** If gap is >2h or >25% of weekly capacity, prompt explicitly:
+  > "Fran has 12h unallocated this week — no active project assignments. What should he work on?"
+
+  For small gaps (≤2h and ≤25% capacity), just show in the grid's Gap row without an explicit prompt. Claude never invents work — always wait for PM input.
 
 ```
 Constraint notes:
 - Fri: off day
-- Gap: 4.1h unallocated — PM to decide
+- ⚠ 12h unallocated — what should Fran work on?
 
 Existing assignments that will be replaced:
 - Vivatura 16h (assignment #12345, 0s tracked) → DELETE + RECREATE
