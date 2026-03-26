@@ -9,29 +9,31 @@ Two modes: **single person** ("plan Fran next week") or **full team** ("plan nex
 
 ## Single-person mode
 
-One person at a time: read, reason, propose, iterate, write.
+One person at a time: read, reason, propose, iterate, write, rebalance.
 
 | Step | What happens | Who acts |
 |------|-------------|----------|
-| **1. Gather** | Read weekly snapshot from Vercel API (capacity, time-off, assignments, budget — one call) | Claude |
-| **2. Propose** | Build per-day, per-project assignment grid with constraint highlights | Claude |
+| **1. Gather** | Read weekly snapshot from Vercel API (capacity, time-off, assignments, budget — one call). Read provisioning baselines; fetch last week's actuals as fallback. | Claude |
+| **2. Propose** | Build per-day, per-project assignment grid with constraint highlights. Flag deviations from provisioning plan inline (hours + EUR). | Claude |
 | **3. Review** | PM adjusts in natural language ("move Thursday to ESN", "reduce Vivatura to 12h") | PM |
 | **4. Confirm** | PM types **confirm** to approve the final plan | PM |
 | **5. Apply** | Delete old work assignments, create new ones via Vercel API | Claude |
-| **6. Verify** | Show applied assignments, flag any API errors | Claude |
+| **6. Rebalance** | Show all deviations for this person's projects with even-spread rebalancing proposals across remaining future weeks. PM confirms, rejects, or modifies. On confirm: update allocation files, commit to main, write future assignments to Everhour. | Claude + PM |
+| **7. Verify** | Show applied assignments (current + future), flag any API errors | Claude |
 
 ## Full-team mode
 
-Fetch snapshot once, iterate through every active person, write on each confirm.
+Fetch snapshot once, iterate through every active person, write on each confirm, rebalance per person.
 
 | Step | What happens | Who acts |
 |------|-------------|----------|
-| **1. Snapshot** | Authenticate, fetch weekly snapshot, show sync timestamp — offer optional fresh sync | Claude |
+| **1. Snapshot** | Authenticate, fetch weekly snapshot + last week's snapshot, show sync timestamp — offer optional fresh sync | Claude |
 | **2. Iterate** | Walk through `people[]` alphabetically; skip full-week time-off | Claude |
-| **3. Per person** | Propose assignments (same single-person format), show budget warnings if overrun | Claude |
+| **3. Per person** | Propose assignments (same single-person format), show budget warnings if overrun, flag deviations from provisioning plan inline (hours + EUR) | Claude |
 | **4. Confirm** | PM adjusts and confirms per person — assignments written immediately (partial commit) | PM + Claude |
-| **5. Next** | Move to next person; if PM stops mid-way, already-confirmed people are applied | Claude |
-| **6. Reconcile** | After last person: re-fetch snapshot, flag budget overruns, >100% utilization, API errors | Claude |
+| **5. Rebalance** | Show deviations + rebalancing proposals for this person. PM confirms, rejects, or modifies. On confirm: update allocation files, commit to main, write future assignments. | Claude + PM |
+| **6. Next** | Move to next person; if PM stops mid-way, already-confirmed people are applied (current week + any confirmed rebalances) | Claude |
+| **7. Reconcile** | After last person: re-fetch snapshot, flag budget overruns, >100% utilization, API errors | Claude |
 
 See [REFERENCE.md](REFERENCE.md) for the full workflow, data sources, capacity logic, API shapes, and example commands.
 

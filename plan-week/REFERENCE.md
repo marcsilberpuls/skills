@@ -4,16 +4,17 @@
 
 This skill plans weekly assignments in two modes:
 
-**Single-person mode** (Steps 1–6):
+**Single-person mode** (Steps 1–7):
 1. PM says "plan [person] next week" (or "plan [person] week of March 30")
-2. Claude gathers all data from the Vercel planner API, proposes assignments
+2. Claude gathers all data from the Vercel planner API + provisioning baselines, proposes assignments with deviation flags
 3. PM reviews, adjusts, confirms
 4. Claude writes confirmed assignments via the Vercel API
+5. Claude detects deviations from provisioning plan, proposes rebalancing of future weeks
 
-**Full-team mode** (Steps 7–10):
+**Full-team mode** (Steps 8–11):
 1. PM says "plan next week" (no person name)
-2. Claude fetches the weekly snapshot once, iterates through all active people alphabetically
-3. For each person: propose, budget-check, PM confirms, write immediately
+2. Claude fetches the weekly snapshot + last week's snapshot once, iterates through all active people alphabetically
+3. For each person: propose with deviation flags, budget-check, PM confirms, write immediately, then rebalance
 4. After last person: reconciliation check
 
 ---
@@ -173,11 +174,22 @@ If `timeOffByDay[i]` is `true`, available is 0 for that day.
 
 No manual capacity computation needed — the snapshot pre-computes this from team-directory.yaml, Everhour time-off, and Timetastic holidays (merged and deduplicated).
 
-### 3b. Project hour inputs
+### 3b. Project hour inputs (baseline priority)
 
-Start with the provisioning baseline (Step 2d) as weekly hour buckets per project. If no baseline exists, use existing assignments from the snapshot (Step 2b) as the starting point.
+Claude uses this priority order to determine starting hours per project:
 
-The PM may override these — "18h Vivatura" replaces whatever the baseline says.
+1. **Provisioning plan** (`everhour-allocation-weekly.json`, Step 2d) — primary baseline. Use the entry matching the target person and target week.
+2. **Last week's actual assignments** — fallback if no provisioning plan entry exists for a project. Fetch via `GET /api/planner/weekly?start=<last-monday>` (same API, previous week's Monday). Use the person's `projects[].assignedHours` from last week as this week's starting point.
+3. **PM input** — overrides everything. "18h Vivatura" replaces whatever the baseline says.
+
+**Fetching last week's data (Step 2e):**
+
+```bash
+curl -s -b /tmp/pc.txt \
+  "https://silberpuls-pipeline.vercel.app/api/planner/weekly?start=<last-monday>"
+```
+
+Where `<last-monday>` is the Monday before the target week (target Monday minus 7 days). Extract the target person's projects and hours. Cache this — it is used both for baseline fallback and for projects without allocation files.
 
 ### 3c. Distribute hours across days
 
@@ -200,6 +212,8 @@ If total project hours exceed total available hours:
 
 ## Step 4: Present the proposal
 
+### 4a. Assignment grid
+
 Show a clear per-day, per-project grid. Format:
 
 ```
@@ -208,14 +222,41 @@ Show a clear per-day, per-project grid. Format:
 Capacity: 40.75h | Time-off: 0h | Available: 40.75h
 
         Mon 30    Tue 31    Wed 01    Thu 02    Fri 03    TOTAL
-Vivat.   4.0       4.0       4.0       4.0       —        16.0h
-ESN      2.0       2.0       2.0       2.0       —         8.0h
+Vivat.   4.5       4.5       4.5       4.5       —        18.0h
+ESN      1.5       1.5       1.5       1.5       —         6.0h
 Intern   1.5       1.5       —         1.5       —         4.5h
 ──────────────────────────────────────────────────────────────
 TOTAL    7.5       7.5       6.0       7.5       0.0      28.5h
 Avail.   8.15      8.15      8.15      8.15      0.0      32.6h
 Gap      0.65      0.65      2.15      0.65      0.0       4.1h
+```
 
+### 4b. Deviation flags (inline, before PM adjusts)
+
+Compare the proposed hours for each project against the provisioning plan (`everhour-allocation-weekly.json`). Show deviations inline, directly below the grid:
+
+```
+Deviations from provisioning plan:
+⚠ Vivatura: plan says 12h, proposing 18h. +6h deviation (+€540 at €90/h)
+⚠ ESN: plan says 8h, proposing 6h. -2h deviation (-€180 at €90/h)
+```
+
+**Rules:**
+- Only flag projects that **have** an entry in `everhour-allocation-weekly.json` for this person and week.
+- Projects **without** an allocation file (or without an entry for this person/week) use last week's actuals as the starting point — **no deviation flag** for these.
+- Show deviation in hours (primary) and EUR (secondary). EUR = deviation hours x person's hourly rate from `team/team-directory-pm.yaml` → `finances.hourly_rate`.
+- Positive deviation = more hours than planned (over plan). Negative = fewer hours (under plan).
+- Zero deviation = no flag needed.
+
+### 4c. Constraint highlights
+
+Flag anything the PM should know:
+- Time-off days (hard constraint — from snapshot `timeOffByDay`)
+- Half-day time-off (reduced capacity — from snapshot `timeOffHoursByDay`)
+- Existing assignments with tracked time (cannot delete — from Step 2c `trackedSeconds`)
+- Unallocated capacity (gap hours)
+
+```
 Constraint notes:
 - Fri: off day
 - Gap: 4.1h unallocated — PM to decide
@@ -224,14 +265,6 @@ Existing assignments that will be replaced:
 - Vivatura 16h (assignment #12345, 0s tracked) → DELETE + RECREATE
 - ESN 8h (assignment #12346, 3600s tracked) → KEEP (has tracked time)
 ```
-
-### Constraint highlight format
-
-Flag anything the PM should know:
-- Time-off days (hard constraint — from snapshot `timeOffByDay`)
-- Half-day time-off (reduced capacity — from snapshot `timeOffHoursByDay`)
-- Existing assignments with tracked time (cannot delete — from Step 2c `trackedSeconds`)
-- Unallocated capacity (gap hours)
 
 ---
 
@@ -330,16 +363,157 @@ Note: The Vercel API automatically syncs the Supabase planner snapshot after wri
 
 ---
 
+## Step 7: Deviation detection and rebalancing
+
+After writing this week's assignments (Step 6), Claude checks for deviations from the provisioning plan and offers to rebalance future weeks. This step runs per person — before moving to the next person in full-team mode.
+
+### 7a. Identify deviations
+
+For each project assigned to this person this week, compare the **confirmed hours** against the **provisioning plan** (`everhour-allocation-weekly.json`):
+
+```
+deviation = confirmed_hours - planned_hours
+deviation_eur = deviation × hourly_rate
+```
+
+- `planned_hours`: from the matching entry in `everhour-allocation-weekly.json` for this person + week
+- `hourly_rate`: from `team/team-directory-pm.yaml` → person's `finances.hourly_rate`
+- **Skip** projects that have no allocation file or no entry for this person/week (these are unplanned — no deviation to detect)
+
+Only proceed if at least one project has a non-zero deviation.
+
+### 7b. Compute rebalancing proposals
+
+For each project with a deviation, compute an even-spread rebalancing across remaining future weeks:
+
+1. **Determine future weeks:** All weeks in `everhour-allocation-weekly.json` where `week_start > target_week` (i.e., weeks after the current planning week). The last week is defined by the last `week_start` entry in the file (project horizon).
+
+2. **Compute adjustment per week:**
+   ```
+   remaining_weeks = count of future weeks with entries for this person
+   adjustment_per_week = -deviation / remaining_weeks
+   new_hours_per_week = original_planned_hours + adjustment_per_week
+   ```
+   Round to nearest 0.5h. Absorb rounding remainder into the last future week.
+
+3. **Guard rails:**
+   - `new_hours_per_week` must be >= 0. If even spread would go negative, cap at 0 and distribute the shortfall across fewer weeks.
+   - If no future weeks remain in the allocation file, warn PM: "No future weeks to rebalance against. Deviation will affect total project budget."
+
+### 7c. Present rebalancing summary
+
+Show all deviations for this person in one block:
+
+```
+=== Fran Marin — Rebalancing after week 14 ===
+
+Deviations this week:
+  Vivatura: +6h over plan (+€540 at €90/h)
+    → Even spread across weeks 15-20 (6 weeks): reduce from 12h to 11h each
+  ESN: -2h under plan (-€180 at €90/h)
+    → Even spread across weeks 15-18 (4 weeks): increase from 8h to 8.5h each
+
+Confirm rebalance? (confirm / reject / modify)
+```
+
+### 7d. PM response handling
+
+| PM says | Claude does |
+|---------|-----------|
+| **"confirm"** | Update allocation files + write future assignments (Steps 7e + 7f) |
+| **"reject"** | Warn about budget consequence, move to next person. Current week is already applied. |
+| **"modify"** / natural language | PM adjusts distribution (e.g., "front-load Vivatura reduction", "put all ESN catch-up in week 15"). Claude recomputes and re-displays. |
+
+**Reject warning format:**
+> "Without rebalancing, Vivatura will be over budget by ~€540 across the remaining project timeline. Future week allocations unchanged."
+
+### 7e. Update allocation files (on rebalance confirm)
+
+For each project with a confirmed rebalance:
+
+1. Read `projects/2-active/<project>/planning/everhour-allocation-weekly.json`
+2. Update the `hours` field for this person in each affected future week entry
+3. Write the file back
+4. Commit directly to main:
+
+```bash
+cd "/Users/marcsiefert/Claude/Silberpuls OS" && \
+git add "projects/2-active/<project>/planning/everhour-allocation-weekly.json" && \
+git commit -m "chore(planning): rebalance <project-name> allocations after week <N> adjustment" && \
+git push
+```
+
+**Rules:**
+- One commit per project (or batch all affected projects in one commit if preferred by PM)
+- No branch, no PR — same partial commit principle as Everhour writes
+- If the session goes stale after this point, allocation files are already persisted
+
+### 7f. Write future assignments to Everhour (on rebalance confirm)
+
+For each project with a confirmed rebalance, write future assignments to Everhour in a single batched API call per person-project:
+
+```bash
+curl -s -b /tmp/pc.txt -X POST \
+  https://silberpuls-pipeline.vercel.app/api/planner/assignments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "personName": "Fran Marin",
+    "projectId": "as:1212371417282301",
+    "projectName": "Vivatura Website & Gesundheitsportal",
+    "startDate": "2026-04-06",
+    "endDate": "2026-05-15",
+    "dayAllocations": [
+      {"day": "2026-04-06", "hours": 2.75},
+      {"day": "2026-04-07", "hours": 2.75},
+      {"day": "2026-04-08", "hours": 2.75},
+      {"day": "2026-04-09", "hours": 2.75},
+      ...
+    ]
+  }'
+```
+
+**Rules:**
+- One API call per person-project combo — `dayAllocations` spans all future weeks through the project horizon
+- Distribute each future week's hours evenly across weekdays (Mon–Fri), same as Step 3c logic
+- `startDate` = Monday of the first future week; `endDate` = Friday of the last future week
+- Skip weekends — only include Mon–Fri in `dayAllocations`
+- Before writing, check for existing future assignments and delete them (same safety rules as Step 6a — respect `trackedSeconds`)
+
+### 7g. Verify and report
+
+After all allocation file commits and future assignment writes:
+
+```
+Rebalancing applied for Fran Marin:
+
+  ALLOCATION FILES UPDATED:
+    ✅ Vivatura — weeks 15-20 updated (12h → 11h each)
+    ✅ ESN — weeks 15-18 updated (8h → 8.5h each)
+
+  FUTURE ASSIGNMENTS WRITTEN:
+    ✅ Vivatura — 66h across weeks 15-20 (11h/week)
+    ✅ ESN — 34h across weeks 15-18 (8.5h/week)
+
+  GIT COMMITS:
+    ✅ chore(planning): rebalance Vivatura allocations after week 14 adjustment
+    ✅ chore(planning): rebalance ESN allocations after week 14 adjustment
+```
+
+Then move to the next person (full-team mode) or finish (single-person mode).
+
+---
+
 ## Data source reference
 
 | Data | Source | What it provides |
 |------|--------|-----------------|
 | Weekly snapshot | `GET /api/planner/weekly?start=YYYY-MM-DD` | Capacity, time-off, assignments, budget per person per project — all pre-computed |
+| Last week's snapshot | `GET /api/planner/weekly?start=<last-monday>` | Previous week's actual assignments — fallback baseline when no provisioning plan exists |
 | Assignment metadata | `GET /api/planner/assignments?personName=X&startDate=Y&endDate=Z` | Assignment IDs + tracked seconds (needed for safe deletion) |
 | Project list | `GET /api/planner/assignments` (no params) | `{ projects: [{ id, name }] }` — for resolving project IDs |
-| Project allocation plans | `projects/2-active/*/planning/everhour-allocation-weekly.json` | Provisioning baseline (planned hours per person per week) |
+| Project allocation plans | `projects/2-active/*/planning/everhour-allocation-weekly.json` | Provisioning baseline (planned hours per person per week), future weeks for rebalancing |
 | Team directory | `team/team-directory.yaml` | Person name resolution (names + aliases) |
-| Team directory (PM-safe) | `team/team-directory-pm.yaml` | Hourly rates (`finances.hourly_rate`) for budget warnings |
+| Team directory (PM-safe) | `team/team-directory-pm.yaml` | Hourly rates (`finances.hourly_rate`) for budget warnings and deviation EUR amounts |
 
 ---
 
@@ -469,23 +643,28 @@ Before any write, present a clear summary and wait for explicit confirmation:
 
 ---
 
-## Step 7: Full-team flow — snapshot and sync offer
+## Step 8: Full-team flow — snapshot and sync offer
 
 When the PM says "plan next week" (or "plan the team", "weekly planning" — no person name), use the full-team flow.
 
-### 7a. Authenticate
+### 8a. Authenticate
 
 Same as Step 2a.
 
-### 7b. Fetch the weekly snapshot
+### 8b. Fetch the weekly snapshot + last week's snapshot
 
-Same as Step 2b — `GET /api/planner/weekly?start=YYYY-MM-DD`. This returns all people in one call.
+Fetch both the target week and last week's snapshots:
+
+- Target week: `GET /api/planner/weekly?start=YYYY-MM-DD` (same as Step 2b)
+- Last week: `GET /api/planner/weekly?start=<last-monday>` (for baseline fallback, same as Step 2e)
+
+This returns all people in one call each. Cache both — reused for every person in the iteration.
 
 Show the snapshot timestamp to the PM:
 
 > "Using planner data last synced at 08:15 today. If time-off was approved in the last hour, it may not be reflected. Want me to trigger a fresh sync first? (~5 minutes)"
 
-### 7c. Optional: trigger fresh sync
+### 8c. Optional: trigger fresh sync
 
 If the PM wants fresh data:
 
@@ -494,13 +673,13 @@ gh workflow run daily-holiday-sync.yml
 gh workflow run hourly-planner-snapshot-sync.yml
 ```
 
-Wait for both workflows to complete (~5 minutes), then re-fetch the snapshot (Step 7b).
+Wait for both workflows to complete (~5 minutes), then re-fetch both snapshots (Step 8b).
 
 ---
 
-## Step 8: Iterate through people
+## Step 9: Iterate through people
 
-### 8a. Sort and filter
+### 9a. Sort and filter
 
 From the snapshot `people[]` array:
 
@@ -509,18 +688,19 @@ From the snapshot `people[]` array:
    > "[Name] is on holiday this week — skipped."
 3. The remaining people are the active list to iterate through.
 
-### 8b. Per-person proposal
+### 9b. Per-person proposal
 
 For each active person, follow the single-person flow:
-- **Compute proposal:** Same as Steps 3a–3d (available hours, project baselines, distribute, handle over-allocation)
-- **Present proposal:** Same as Step 4 (per-day, per-project grid with constraints)
-- **Budget check:** See Step 8c below — add budget warnings to the proposal when applicable
+- **Compute proposal:** Same as Steps 3a–3d (available hours, project baselines with priority from 3b, distribute, handle over-allocation)
+- **Present proposal:** Same as Step 4 (per-day, per-project grid with deviation flags + constraints)
+- **Budget check:** See Step 9c below — add budget warnings to the proposal when applicable
 - **PM iteration:** Same as Step 5 (PM adjusts, Claude re-displays)
-- **Apply on confirm:** See Step 9 below (write immediately, partial commit)
+- **Apply on confirm:** See Step 10 below (write immediately, partial commit)
+- **Rebalance:** After writing current week, run Step 7 (deviation detection + rebalancing) before moving to next person
 
 Then move to the next person.
 
-### 8c. Budget warnings
+### 9c. Budget warnings
 
 After computing the proposal for a person, check each project's budget. Only warn when this week's proposed hours would exceed the remaining budget.
 
@@ -545,7 +725,7 @@ safe_hours = remaining_eur / hourly_rate  (floored to nearest 0.5h)
 - `budgetTotalEur` is null (no budget set) — skip budget check
 - `proposed_cost <= remaining_eur` — within budget, no warning needed
 
-### 8d. Project ID resolution
+### 9d. Project ID resolution
 
 When PM mentions a project by name during iteration (e.g., "add 4h Sixt"):
 
@@ -557,11 +737,11 @@ When PM mentions a project by name during iteration (e.g., "add 4h Sixt"):
 
 ---
 
-## Step 9: Apply per person (partial commit)
+## Step 10: Apply per person (partial commit)
 
-When the PM confirms a person's plan, write assignments immediately. Do not wait for the full team to be done.
+When the PM confirms a person's plan, write assignments immediately. Do not wait for the full team to be done. After writing, run Step 7 (deviation detection + rebalancing) before moving to the next person.
 
-### 9a. Assignments with tracked time (PATCH)
+### 10a. Assignments with tracked time (PATCH)
 
 For assignments where `trackedSeconds > 0`, use PATCH to update in place — this preserves tracked time:
 
@@ -585,30 +765,30 @@ Required fields: `assignmentId`, `userId`, `personName`, `projectId`, `projectNa
 
 Get `assignmentId` and `userId` from the GET assignments call (Step 2c).
 
-### 9b. Clean assignments (DELETE + CREATE)
+### 10b. Clean assignments (DELETE + CREATE)
 
 For assignments where `trackedSeconds == 0` (`canDelete == true`): same as Step 6a (DELETE) + Step 6b (CREATE).
 
-### 9c. Verify per person
+### 10c. Verify per person
 
-After writing, show a brief summary (same as Step 6c) and move to the next person.
+After writing, show a brief summary (same as Step 6c), then proceed to Step 7 (rebalancing). After rebalancing is complete (or skipped), move to the next person.
 
-**If PM stops mid-way** (closes conversation, says "stop", etc.): already-confirmed people's assignments are applied. Unconfirmed people are unchanged.
+**If PM stops mid-way** (closes conversation, says "stop", etc.): already-confirmed people's assignments are applied (current week + any confirmed rebalances). Unconfirmed people are unchanged.
 
 ---
 
-## Step 10: Reconciliation check
+## Step 11: Reconciliation check
 
-After the last person is confirmed and written, run a final reconciliation.
+After the last person is confirmed, written, and rebalanced, run a final reconciliation.
 
-### 10a. Re-fetch snapshot
+### 11a. Re-fetch snapshot
 
 ```bash
 curl -s -b /tmp/pc.txt \
   "https://silberpuls-pipeline.vercel.app/api/planner/weekly?start=YYYY-MM-DD"
 ```
 
-### 10b. Check for issues
+### 11b. Check for issues
 
 Compare the fresh snapshot against what was planned. Flag:
 
@@ -618,11 +798,14 @@ Compare the fresh snapshot against what was planned. Flag:
 2. **Over-utilization:** Any person where `utilizationPct > 100`
    > "⚠ [Name]: utilization is [X]% — over-allocated by [Y]h."
 
-3. **API errors:** Any assignments that failed to write during the session (track these as you go in Step 9)
+3. **API errors:** Any assignments that failed to write during the session (track these as you go in Step 10)
    > "⚠ Failed to write [Name]'s [Project] assignment — [error message]. Retry manually."
 
-### 10c. Clean report
+4. **Rebalancing failures:** Any allocation file commits or future assignment writes that failed during Step 7
+   > "⚠ Failed to commit rebalanced allocations for [Project] — [error message]. Run manually."
+
+### 11c. Clean report
 
 If no issues are detected:
 
-> "All assignments applied. No issues detected."
+> "All assignments applied. All rebalances committed. No issues detected."
