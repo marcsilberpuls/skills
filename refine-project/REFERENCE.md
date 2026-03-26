@@ -227,7 +227,7 @@ Assignments to create:
     Week 14 (Mar 27-31): 6.0h — Mon-Thu 1.5h/day
     Week 15 (Apr  6-10): 6.0h — Mon-Thu 1.5h/day
 
-  Kathi Mayer — 32.0h total (EUR 4,000)
+  Kathi Tauer — 32.0h total (EUR 4,000)
     Week 14 (Mar 27-31): 16.0h — Mon-Thu 4.0h/day
     Week 15 (Apr  6-10): 16.0h — Mon-Thu 4.0h/day
 
@@ -254,14 +254,14 @@ Schema:
       "week_start": "2026-03-30",
       "entries": [
         { "person": "Marc Siefert", "hours": 6.0, "note": "PM" },
-        { "person": "Kathi Mayer", "hours": 16.0, "note": "Design" }
+        { "person": "Kathi Tauer", "hours": 16.0, "note": "Design" }
       ]
     },
     {
       "week_start": "2026-04-06",
       "entries": [
         { "person": "Marc Siefert", "hours": 6.0, "note": "PM" },
-        { "person": "Kathi Mayer", "hours": 16.0, "note": "Design" }
+        { "person": "Kathi Tauer", "hours": 16.0, "note": "Design" }
       ]
     }
   ]
@@ -336,7 +336,7 @@ curl -s -b /tmp/pc.txt -X DELETE \
   -d '{
     "assignmentId": 98765,
     "trackedSeconds": 0,
-    "personName": "Kathi Mayer",
+    "personName": "Kathi Tauer",
     "projectId": "as:1212148517388873",
     "projectName": "Obi",
     "startDate": "2026-03-30",
@@ -353,7 +353,7 @@ curl -s -b /tmp/pc.txt -X POST \
   https://silberpuls-pipeline.vercel.app/api/planner/assignments \
   -H "Content-Type: application/json" \
   -d '{
-    "personName": "Kathi Mayer",
+    "personName": "Kathi Tauer",
     "projectId": "as:1212148517388873",
     "projectName": "Obi",
     "startDate": "2026-03-30",
@@ -386,7 +386,7 @@ Assignments written for Obi:
   Marc Siefert:
     CREATED: 12.0h across Mar 30 - Apr 10 (1.5h/day, Mon-Thu)
 
-  Kathi Mayer:
+  Kathi Tauer:
     CREATED: 32.0h across Mar 30 - Apr 10 (4.0h/day, Mon-Thu)
 
 All assignments applied successfully.
@@ -456,7 +456,7 @@ curl -s -b /tmp/pc.txt -X POST \
   https://silberpuls-pipeline.vercel.app/api/planner/assignments \
   -H "Content-Type: application/json" \
   -d '{
-    "personName": "Kathi Mayer",
+    "personName": "Kathi Tauer",
     "projectId": "as:1212148517388873",
     "projectName": "Obi",
     "startDate": "2026-03-30",
@@ -477,7 +477,7 @@ curl -s -b /tmp/pc.txt -X DELETE \
   -d '{
     "assignmentId": 98765,
     "trackedSeconds": 0,
-    "personName": "Kathi Mayer",
+    "personName": "Kathi Tauer",
     "projectId": "as:1212148517388873",
     "projectName": "Obi",
     "startDate": "2026-03-30",
